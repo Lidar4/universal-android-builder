@@ -1,0 +1,6 @@
+{
+  "name": "Universal Android Builder",
+  "description": "A developer-focused full-stack dashboard for configuring, inspecting, and automating builds of native Android applications through GitHub Actions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

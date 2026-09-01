@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - feature/automatic-hotspot-companion
   workflow_dispatch:
 
 jobs:

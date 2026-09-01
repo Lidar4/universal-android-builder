@@ -1,7 +1,6 @@
 package com.universal.androidbuilder
 
 import android.Manifest
-import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.nsd.NsdManager
@@ -30,10 +29,8 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.URL
 import java.util.UUID
 import java.util.concurrent.Executors
 
@@ -45,12 +42,23 @@ class MainActivity : ComponentActivity() {
     private var status by mutableStateOf("Ready")
     private var targetInfo by mutableStateOf("No target detected")
     private var targetTelemetry by mutableStateOf("Waiting for live telemetry")
+    private var hotspotSsid by mutableStateOf("")
+    private var hotspotPassword by mutableStateOf("")
+    private var hotspotStatus by mutableStateOf("Hotspot not started")
     private var server: HostServer? = null
     private var discovery: TargetDiscovery? = null
+    private var hotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private val deviceId = UUID.randomUUID().toString()
 
     private val nearbyPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startTargetDiscovery() else status = "Nearby devices permission is required for automatic discovery"
+    }
+
+    private val hotspotPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) startRealHotspot() else {
+            hotspotStatus = "Nearby devices permission denied"
+            status = "Allow Nearby devices so this phone can create the technician hotspot"
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -63,6 +71,9 @@ class MainActivity : ComponentActivity() {
                         status = status,
                         targetInfo = targetInfo,
                         targetTelemetry = targetTelemetry,
+                        hotspotSsid = hotspotSsid,
+                        hotspotPassword = hotspotPassword,
+                        hotspotStatus = hotspotStatus,
                         onMaster = { startMaster() },
                         onTarget = { requestTargetPermissionAndStart() },
                         onStop = { stopAll() }
@@ -75,7 +86,62 @@ class MainActivity : ComponentActivity() {
     private fun startMaster() {
         stopAll()
         role = "master"
-        status = "Starting local technician host..."
+        status = "Starting real local-only Wi-Fi hotspot..."
+        hotspotStatus = "Requesting Android hotspot..."
+        startRealHotspot()
+    }
+
+    private fun startRealHotspot() {
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
+            hotspotStatus = "Waiting for Nearby devices permission"
+            hotspotPermission.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+            return
+        }
+
+        val wifi = getSystemService(WIFI_SERVICE) as WifiManager
+        try {
+            wifi.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
+                override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation) {
+                    hotspotReservation = reservation
+                    val config = if (Build.VERSION.SDK_INT >= 30) reservation.softApConfiguration else null
+                    hotspotSsid = config?.ssid ?: ""
+                    hotspotPassword = if (Build.VERSION.SDK_INT >= 30) {
+                        config?.passphrase ?: ""
+                    } else {
+                        @Suppress("DEPRECATION")
+                        reservation.wifiConfiguration?.preSharedKey ?: ""
+                    }
+                    hotspotStatus = "HOTSPOT READY — open Wi-Fi on the Target phone and connect"
+                    status = "MASTER HOTSPOT READY"
+                    startHostServices()
+                }
+
+                override fun onStopped() {
+                    hotspotStatus = "Hotspot stopped by Android or the user"
+                    if (role == "master") status = "HOTSPOT STOPPED"
+                }
+
+                override fun onFailed(reason: Int) {
+                    hotspotStatus = when (reason) {
+                        WifiManager.LocalOnlyHotspotCallback.ERROR_INCOMPATIBLE_MODE -> "Hotspot failed: incompatible Wi-Fi/tethering mode"
+                        WifiManager.LocalOnlyHotspotCallback.ERROR_TETHERING_DISALLOWED -> "Hotspot failed: tethering is disallowed on this device"
+                        WifiManager.LocalOnlyHotspotCallback.ERROR_NO_CHANNEL -> "Hotspot failed: no Wi-Fi channel available"
+                        else -> "Hotspot failed: Android error $reason"
+                    }
+                    status = hotspotStatus
+                }
+            }, null)
+        } catch (security: SecurityException) {
+            hotspotStatus = "Hotspot permission error: ${security.message ?: "Nearby devices permission required"}"
+            status = hotspotStatus
+        } catch (error: Exception) {
+            hotspotStatus = "Could not start hotspot: ${error.message ?: "unknown error"}"
+            status = hotspotStatus
+        }
+    }
+
+    private fun startHostServices() {
+        server?.stop()
         server = HostServer(PORT) { path, body ->
             if (path == "/register") {
                 targetInfo = "Authorized target: ${body.optString("model", "Android device")} · ${body.optString("android", "Android") }"
@@ -88,7 +154,6 @@ class MainActivity : ComponentActivity() {
         }
         server?.start()
         advertiseMaster()
-        status = "MASTER HOTSPOT HOST READY"
     }
 
     private fun requestTargetPermissionAndStart() {
@@ -175,10 +240,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopDiscoveryOnly() { discovery?.stop(); discovery = null }
+
     private fun stopAll() {
+        hotspotReservation?.close()
+        hotspotReservation = null
         role = "choose"
         server?.stop(); server = null
         stopDiscoveryOnly()
+        hotspotSsid = ""
+        hotspotPassword = ""
+        hotspotStatus = "Hotspot not started"
         status = "Ready"
         targetInfo = "No target detected"
         targetTelemetry = "Waiting for live telemetry"
@@ -250,21 +321,47 @@ private class HostServer(private val port: Int, private val handler: (String, JS
 }
 
 @Composable
-private fun TechnicianCompanionScreen(role: String, status: String, targetInfo: String, targetTelemetry: String, onMaster: () -> Unit, onTarget: () -> Unit, onStop: () -> Unit) {
+private fun TechnicianCompanionScreen(
+    role: String,
+    status: String,
+    targetInfo: String,
+    targetTelemetry: String,
+    hotspotSsid: String,
+    hotspotPassword: String,
+    hotspotStatus: String,
+    onMaster: () -> Unit,
+    onTarget: () -> Unit,
+    onStop: () -> Unit
+) {
     Column(modifier = Modifier.fillMaxSize().padding(18.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text("AI Android Technician Companion", style = MaterialTheme.typography.headlineSmall)
-        Text("Hotspot → automatic discovery → user authorization → live device telemetry")
-        Card(modifier = Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) { Text("Status", style = MaterialTheme.typography.titleMedium); Text(status); Text("Mode: ${if (role == "choose") "Not selected" else role.uppercase()}") } }
+        Text("Real Android local hotspot → Wi-Fi connection → automatic discovery → authorized telemetry")
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                Text("Status", style = MaterialTheme.typography.titleMedium)
+                Text(status)
+                Text("Mode: ${if (role == "choose") "Not selected" else role.uppercase()}")
+            }
+        }
         if (role == "choose") {
             Button(onClick = onMaster, modifier = Modifier.fillMaxWidth()) { Text("This phone is MASTER") }
             OutlinedButton(onClick = onTarget, modifier = Modifier.fillMaxWidth()) { Text("This phone is TARGET") }
         } else {
             if (role == "master") {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Real Wi-Fi hotspot", style = MaterialTheme.typography.titleMedium)
+                        Text(hotspotStatus)
+                        if (hotspotSsid.isNotBlank()) Text("Wi-Fi name (SSID): $hotspotSsid")
+                        if (hotspotPassword.isNotBlank()) Text("Wi-Fi password: $hotspotPassword")
+                        Text("On the Target phone, open Wi-Fi and connect to this SSID using the password above.")
+                    }
+                }
                 Text("Target", style = MaterialTheme.typography.titleMedium)
                 Text(targetInfo)
                 Text(targetTelemetry)
             } else {
-                Text("The Target Companion is automatically searching the current hotspot for the Master.")
+                Text("After the Target phone connects to the Master's Wi-Fi hotspot, this companion searches for the technician host automatically.")
                 Text("No pairing code is required.")
             }
             OutlinedButton(onClick = onStop, modifier = Modifier.fillMaxWidth()) { Text("Stop") }
